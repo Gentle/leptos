@@ -258,7 +258,7 @@ where
         let r = Rc::clone(&r);
         // This is a local resource, so we're always going to handle it on the
         // client
-        move |_| r.load(false)
+        move |_| r.load(id, false)
     });
 
     cx.with_scope_property(|prop| prop.push(ScopeProperty::Resource(id)));
@@ -274,12 +274,12 @@ where
 }
 
 #[cfg(not(feature = "hydrate"))]
-fn load_resource<S, T>(_cx: Scope, _id: ResourceId, r: Rc<ResourceState<S, T>>)
+fn load_resource<S, T>(_cx: Scope, id: ResourceId, r: Rc<ResourceState<S, T>>)
 where
     S: PartialEq + Debug + Clone + 'static,
     T: 'static,
 {
-    r.load(false)
+    r.load(id, false)
 }
 
 #[cfg(feature = "hydrate")]
@@ -342,7 +342,7 @@ where
         } else {
             // Server didn't mark the resource as pending, so load it on the
             // client
-            r.load(false);
+            r.load(id, false);
         }
     })
 }
@@ -363,7 +363,9 @@ where
         T: Clone,
     {
         with_runtime(self.runtime, |runtime| {
-            runtime.resource(self.id, |resource: &ResourceState<S, T>| resource.read())
+            runtime.resource(self.id, |resource: &ResourceState<S, T>| {
+                resource.read(self.id)
+            })
         })
         .ok()
         .flatten()
@@ -378,7 +380,9 @@ where
     /// [Resource::read].
     pub fn with<U>(&self, f: impl FnOnce(&T) -> U) -> Option<U> {
         with_runtime(self.runtime, |runtime| {
-            runtime.resource(self.id, |resource: &ResourceState<S, T>| resource.with(f))
+            runtime.resource(self.id, |resource: &ResourceState<S, T>| {
+                resource.with(self.id, f)
+            })
         })
         .ok()
         .flatten()
@@ -395,7 +399,9 @@ where
     /// Re-runs the async function with the current source data.
     pub fn refetch(&self) {
         _ = with_runtime(self.runtime, |runtime| {
-            runtime.resource(self.id, |resource: &ResourceState<S, T>| resource.refetch())
+            runtime.resource(self.id, |resource: &ResourceState<S, T>| {
+                resource.refetch(self.id)
+            })
         });
     }
 
@@ -562,14 +568,14 @@ where
     S: Clone + 'static,
     T: 'static,
 {
-    pub fn read(&self) -> Option<T>
+    pub fn read(&self, id: ResourceId) -> Option<T>
     where
         T: Clone,
     {
-        self.with(T::clone)
+        self.with(id, T::clone)
     }
 
-    pub fn with<U>(&self, f: impl FnOnce(&T) -> U) -> Option<U> {
+    pub fn with<U>(&self, id: ResourceId, f: impl FnOnce(&T) -> U) -> Option<U> {
         let suspense_cx = use_context::<SuspenseContext>(self.scope);
 
         let v = self
@@ -591,7 +597,7 @@ where
                     // because the context has been tracked here
                     // on the first read, resource is already loading without having incremented
                     if !has_value {
-                        s.increment();
+                        s.increment(id);
                     }
                 }
             }
@@ -601,11 +607,11 @@ where
         v
     }
 
-    pub fn refetch(&self) {
-        self.load(true);
+    pub fn refetch(&self, id: ResourceId) {
+        self.load(id, true);
     }
 
-    fn load(&self, refetching: bool) {
+    fn load(&self, id: ResourceId, refetching: bool) {
         // doesn't refetch if already refetching
         if refetching && self.scheduled.get() {
             return;
@@ -631,7 +637,7 @@ where
             let suspense_contexts = self.suspense_contexts.clone();
 
             for suspense_context in suspense_contexts.borrow().iter() {
-                suspense_context.increment();
+                suspense_context.increment(id);
             }
 
             // run the Future
@@ -648,7 +654,7 @@ where
                     set_loading.update(|n| *n = false);
 
                     for suspense_context in suspense_contexts.borrow().iter() {
-                        suspense_context.decrement();
+                        suspense_context.decrement(id);
                     }
                 }
             })
