@@ -2,10 +2,10 @@
 
 use crate::{CoreComponent, HydrationCtx, IntoView, View};
 use cfg_if::cfg_if;
-use futures::{stream::FuturesUnordered, Stream, StreamExt};
+use futures::{stream::FuturesUnordered, Future, Stream, StreamExt};
 use itertools::Itertools;
 use leptos_reactive::*;
-use std::borrow::Cow;
+use std::{borrow::Cow, pin::Pin, sync::Arc};
 
 /// Renders the given function to a static HTML string.
 ///
@@ -151,53 +151,57 @@ pub fn render_to_stream_with_prefix_undisposed_with_context(
     }
   });
 
-  let fragments = FuturesUnordered::new();
-  for (fragment_id, (key_before, fut)) in pending_fragments {
-    fragments.push(async move { (fragment_id, key_before, fut.await) })
-  }
+  let tasks: FuturesUnordered<Pin<Box<dyn Future<Output = String>>>> =
+    FuturesUnordered::new();
 
   // resources and fragments
   // stream HTML for each <Suspense/> as it resolves
-  // TODO can remove id_before_suspense entirely now
-  let fragments = fragments.map(|(fragment_id, _, html)| {
-    format!(
-      r#"
-              <template id="{fragment_id}f">{html}</template>
-              <script>
-                  var id = "{fragment_id}";
-                  var open;
-                  var close;
-                  var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
-                  while(walker.nextNode()) {{
-                       if(walker.currentNode.textContent == `suspense-open-${{id}}`) {{
-                         open = walker.currentNode;
-                       }} else if(walker.currentNode.textContent == `suspense-close-${{id}}`) {{
-                         close = walker.currentNode;
-                       }}
-                    }}
-                  var range = new Range();
-                  range.setStartAfter(open);
-                  range.setEndBefore(close);
-                  range.deleteContents();
-                  var tpl = document.getElementById("{fragment_id}f");
-                  close.parentNode.insertBefore(tpl.content.cloneNode(true), close);
-              </script>
-              "#
-    )
-  });
+  for (fragment_id, (_key_before, fut)) in pending_fragments {
+    tasks.push(Box::pin(async move {
+      let html = fut.await;
+      format!(
+        r#"
+                <template id="{fragment_id}f">{html}</template>
+                <script>
+                    var id = "{fragment_id}";
+                    var open;
+                    var close;
+                    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
+                    while(walker.nextNode()) {{
+                         if(walker.currentNode.textContent == `suspense-open-${{id}}`) {{
+                           open = walker.currentNode;
+                         }} else if(walker.currentNode.textContent == `suspense-close-${{id}}`) {{
+                           close = walker.currentNode;
+                         }}
+                      }}
+                    var range = new Range();
+                    range.setStartAfter(open);
+                    range.setEndBefore(close);
+                    range.deleteContents();
+                    var tpl = document.getElementById("{fragment_id}f");
+                    close.parentNode.insertBefore(tpl.content.cloneNode(true), close);
+                </script>
+                "#
+      )
+    }));
+  }
+
   // stream data for each Resource as it resolves
-  let resources = serializers.map(|(id, json)| {
-    let id = serde_json::to_string(&id).unwrap();
-    format!(
-      r#"<script>
+  for fut in serializers.into_iter() {
+    tasks.push(Box::pin(async move {
+      let (id, json) = fut.await;
+      let id = serde_json::to_string(&id).unwrap();
+      format!(
+        r#"<script>
                   if(__LEPTOS_RESOURCE_RESOLVERS.get({id})) {{
                       __LEPTOS_RESOURCE_RESOLVERS.get({id})({json:?})
                   }} else {{
                       __LEPTOS_RESOLVED_RESOURCES.set({id}, {json:?});
                   }}
               </script>"#,
-    )
-  });
+      )
+    }));
+  }
 
   // HTML for the view function and script to store resources
   let stream = futures::stream::once(async move {
@@ -213,10 +217,9 @@ pub fn render_to_stream_with_prefix_undisposed_with_context(
           "#
     )
   })
-  // TODO these should be combined again in a way that chains them appropriately
-  // such that individual resources can resolve before all fragments are done
-  .chain(fragments)
-  .chain(resources);
+  // TODO use the dependency graph in leptos_reactive::suspense to make sure all fragments are sent before their resources
+  // these are first come first serve right now, I just assume fragments are faster than resources
+  .chain(tasks);
 
   (stream, runtime, scope)
 }
